@@ -1,0 +1,157 @@
+on:
+  workflow_call:
+    inputs:
+      main_branch_name:
+        default: "main"
+        required: false
+        type: string
+      is_pr_merged:
+        default: false
+        required: false
+        type: boolean
+    secrets:
+      VG_NODE_TOKEN:
+        required: true
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      DEPLOYMENT_GITHUB_TOKEN:
+        required: true
+    outputs:
+      RELEASE_TAG:
+        description: "release tag"
+        value: ${{ jobs.create_release_tag.outputs.tag_name }}
+
+name: VG Build Template
+jobs:
+  build_and_test:
+    name: Build and test job
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Get yarn cache directory path
+        id: yarn-cache-dir-path
+        run: echo '::set-output name=dir::$(yarn cache dir)'
+
+      - uses: actions/cache@v2
+        name: validate cache
+        id: yarn-cache
+        with:
+          path: |
+            ~/.cache/Cypress 
+            ${{ steps.yarn-cache-dir-path.outputs.dir }}
+            **/.next/cache
+            **/node_modules
+            node_modules
+          key: ${{ runner.os }}-vg-build-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-vg-build-yarn-
+
+      - uses: actions/setup-node@v2
+        with:
+          registry-url: "https://npm.pkg.github.com"
+          scope: "@virusgeeks"
+          always-auth: true
+
+      - name: Installing yarn dependencies
+        run: yarn install --frozen-lockfile --prefer-offline
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.VG_NODE_TOKEN }}
+
+      - name: Build
+        run: yarn build
+
+      - name: Lint
+        run: yarn lint
+
+      - name: Test
+        run: yarn test
+
+      - uses: actions/upload-artifact@v2
+        if: ${{ always() }}
+        continue-on-error: true
+        with:
+          name: cypress-screenshots
+          path: ${{ github.workspace }}/**/cypress/screenshots
+
+      - uses: actions/upload-artifact@v2
+        if: ${{ always() }}
+        continue-on-error: true
+        with:
+          name: cypress-videos
+          path: ${{ github.workspace }}/**/cypress/videos
+
+      - uses: actions/upload-artifact@v2
+        if: ${{ always() }}
+        continue-on-error: true
+        with:
+          name: test-results
+          path: ${{ github.workspace }}/**/reports
+
+  create_release_tag:
+    name: Create release tag
+    runs-on: ubuntu-latest
+    if: ${{ inputs.is_pr_merged }}
+    needs: [build_and_test]
+    outputs:
+      tag_name: ${{ steps.version-tag.outputs.tag }}
+
+    steps:
+      - name: Generate version tag
+        id: version-tag
+        run: echo "::set-output name=tag::$(date +'%Y-%m-%d-%H-%M-%S')"
+
+      - name: Create version and tag
+        uses: mathieudutour/github-tag-action@v5.5
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          custom_tag: ${{ steps.version-tag.outputs.tag }}
+          tag_prefix: ""
+
+  push_image:
+    name: Push Image to container registry
+    needs: [create_release_tag]
+    runs-on: ubuntu-latest
+    outputs:
+      app_name: ${{ steps.repository-name.outputs.name }}
+
+    steps:
+      - name: Get Repository Name
+        id: repository-name
+        run: echo "::set-output name=name::${GITHUB_REPOSITORY#*\/}"
+
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ needs.create_release_tag.outputs.tag_name }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-west-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ steps.repository-name.outputs.name }}
+          IMAGE_TAG: ${{ needs.create_release_tag.outputs.tag_name }}
+          NODE_AUTH_TOKEN: ${{ secrets.VG_NODE_TOKEN }}
+        run: |
+          # Build a docker container and
+          # push it to ECR so that it can
+          # be deployed to ECS.
+          echo //npm.pkg.github.com/:_authToken=$NODE_AUTH_TOKEN >> .npmrc
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
